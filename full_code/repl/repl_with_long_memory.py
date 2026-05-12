@@ -14,28 +14,40 @@ from mem0 import Memory
 
 from config import OLLAMA_HOST, OLLAMA_MODEL
 
-# Who the memories belong to.
-USER_ID = input("Enter your user id: ")
-
 # Where mem0 keeps its vector store on disk. Survives restarts.
+# Delete this directory to wipe all memories and start fresh.
 MEMORY_DB_PATH = os.path.expanduser("~/.ollama-python/mem0_db")
 
-# Models used for fact extraction
+# Model used by mem0 to extract durable facts from conversations.
+# Needs to be smart enough to distinguish "the user said X" from
+# generic assistant text. A 2B model is too small for reliable
+# extraction; 3B is the practical minimum.
 EXTRACTION_MODEL = "granite3.3:2b"
-# Model used for text embedding
+
+# Model used to turn text into vectors for similarity search.
 EMBED_MODEL = "nomic-embed-text:v1.5"
-# Collection name in Chroma (mem0's vector store)
+
+# Collection name inside Chroma. One collection per app is fine.
 COLLECTION_NAME = "repl_memories"
+
+# Set inside main() once the user has typed their id at the prompt.
+# Kept at module scope because the background-thread closure reads it.
+USER_ID: str = ""
+
+# Tracks every memory write thread we spawn. /bye joins these before
+# exiting so writes finish landing on disk instead of being killed
+# mid-call as orphan daemons.
+_write_threads: list[threading.Thread] = []
 
 
 def build_memory() -> Memory:
     """Build a fully local mem0 instance backed by Ollama and Chroma.
 
     Three components are configured:
-      - llm: extracts facts from conversations.
-      - embedder: turns text into vectors to perform vector search.
-      - vector_store: where the vectors live. Chroma is the simplest
-        option.
+      - llm: extracts facts from conversations (EXTRACTION_MODEL).
+      - embedder: turns text into vectors for similarity search.
+      - vector_store: where the vectors live. Chroma persists to disk
+        with no extra services to run.
     """
     config = {
         "llm": {
@@ -64,16 +76,17 @@ def build_memory() -> Memory:
 
 
 def relevant_memories(memory: Memory, query: str, user_id: str, k: int = 5) -> str:
-    """Search memory and format the top-k results as a string for the prompt.
+    """Search memory and return the top-k facts as a formatted string.
 
     Returns an empty string if nothing relevant was found, so the caller
-    can skip the system message entirely in that case.
+    can skip the system message injection entirely in that case.
     """
-    # search for facts relevant to the user's question
+    # mem0 v2: scoping moved from top-level kwargs into a filters dict.
     results = memory.search(query=query, filters={"user_id": user_id}, limit=k)
 
-    # Get the results as a list of dicts.
-    items = results.get("results", results)  # if isinstance(results, dict) else results
+    # search() returns {"results": [...]} in v2; older versions returned
+    # a bare list. Handle both.
+    items = results.get("results", results)
     if not items:
         return ""
 
@@ -82,27 +95,33 @@ def relevant_memories(memory: Memory, query: str, user_id: str, k: int = 5) -> s
 
 
 def write_memory_async(memory: Memory, user_text: str, reply: str) -> None:
-    """Fire mem0.add() in a background thread.
+    """Fire mem0.add() in a background thread, tracked for clean shutdown.
 
-    Fact extraction calls the configured LLM internally.
+    Use infer=False to skip mem0's LLM-based extraction and dedup
+    steps. They are slow (two LLM calls) and unreliable on small local
+    models (silently drop facts). Verbatim storage is fast, reliable,
+    and good enough for vector search to find the right context later.
     """
 
     def _run() -> None:
         try:
-            # Write to the memory store
+            print("\nMemory write started...", flush=True)
             memory.add(
                 messages=[
                     {"role": "user", "content": user_text},
                     {"role": "assistant", "content": reply},
                 ],
                 user_id=USER_ID,
+                infer=True,
             )
-        except Exception as e:
-            print(f"\n(memory write failed: {e})")
+            print("\nMemory write complete...", flush=True)
 
-    # daemon=True so the thread dies with the process; /bye exits cleanly
-    # even if a write is mid-flight.
-    threading.Thread(target=_run, daemon=True).start()
+        except Exception as e:
+            print(f"\n(memory write failed: {e})", flush=True)
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    _write_threads.append(t)
 
 
 def read_input() -> str:
@@ -119,6 +138,12 @@ def read_input() -> str:
 
 
 def main() -> None:
+    # Prompt for user id inside main() instead of at module scope, so
+    # importing repl.py from a debug script doesn't trigger an input()
+    # prompt. Defaults to "default" if the user just hits Enter.
+    global USER_ID
+    USER_ID = input("Enter your user id: ").strip() or "default"
+
     # The worker model handles each turn of the chat.
     llm = ChatOllama(
         model=OLLAMA_MODEL,
@@ -133,7 +158,9 @@ def main() -> None:
         num_predict=512,
     )
 
-    # The agent: chat model + in-session summarization middleware.
+    # The agent wraps the chat model with in-session summarization
+    # middleware. Long-term memory (mem0) handles cross-session facts;
+    # the summarizer handles overflow within one running conversation.
     agent = create_agent(
         model=llm,
         tools=[],
@@ -147,29 +174,41 @@ def main() -> None:
     )
 
     print("Loading memory...")
-    # Load the memory store
     memory = build_memory()
 
     print(f"Chatting with {OLLAMA_MODEL} (with long-term memory).")
     print("Hit Enter on an empty line to send. Type /bye to exit.")
+    print("Waiting for pending memory writes is automatic on /bye.\n")
 
     while True:
         user = read_input()
         if user == "":
             continue
+
         if user.strip() == "/bye":
+            # Wait for any in-flight memory writes before exiting.
+            # Without this, daemon threads get killed mid-call and the
+            # facts from the most recent turn never land in Chroma.
+            pending = [t for t in _write_threads if t.is_alive()]
+            if pending:
+                print(f"Waiting for {len(pending)} memory write(s) to finish...")
+                for t in pending:
+                    t.join()
             break
 
-        print("[searching memory...]", flush=True)
+        # Search memory for facts relevant to this turn's question.
         memory_block = relevant_memories(memory, query=user, user_id=USER_ID)
 
+        # Build the prompt for this turn: a system message containing
+        # any relevant facts (if we have any), followed by the user's
+        # message. We rebuild this list every turn because mem0 is now
+        # the source of long-term memory; there's no in-Python history.
         messages: list = []
-        # If there's a relevant memory block, inject it as a system message.
         if memory_block:
             messages.append(SystemMessage(content=memory_block))
         messages.append(HumanMessage(content=user))
 
-        print("[calling agent.stream...]", flush=True)
+        # Stream the reply, accumulating it for the memory write.
         full_reply = ""
         for chunk, _ in agent.stream(
             {"messages": messages},
@@ -179,8 +218,10 @@ def main() -> None:
                 print(chunk.content, end="", flush=True)
                 full_reply += chunk.content
         print()
-        print("[stream done]", flush=True)
 
+        # Fire the memory write in the background. The next prompt
+        # appears immediately; the write finishes asynchronously and
+        # prints "(memory write done: ...)" when it lands.
         write_memory_async(memory, user, full_reply)
 
 
